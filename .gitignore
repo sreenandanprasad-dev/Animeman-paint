@@ -1,0 +1,16 @@
+node_modules/
+dist/
+public/vision/wasm/
+art-source/
+android/.gradle/
+android/local.properties
+android/**/build/
+artifacts/
+release/*
+!release/KomaStudio.apk
+*.jks
+*.keystore
+*.p12
+*.idsig
+.env*
+.DS_Store

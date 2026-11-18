@@ -1,0 +1,178 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { launch, productionServer, screenshots } from './browser.mjs';
+
+const server=await productionServer();
+const browser=await launch().catch(error=>{server.close();throw error;});
+let page;
+try {
+  const context=await browser.newContext({viewport:{width:390,height:844},isMobile:true,hasTouch:true,deviceScaleFactor:3,acceptDownloads:true});
+  page=await context.newPage();
+  page.setDefaultTimeout(12500);
+  const errors=[], failed=[], unexpected=[];
+  page.on('pageerror',e=>errors.push(e.message));
+  page.on('console',m=>{if(m.type()==='error')errors.push(m.text());});
+  page.on('response',r=>{if(r.status()>=400)failed.push(`${r.status()} ${r.url()}`);});
+  page.on('request',r=>{if(!r.url().startsWith(server.url)&&!/^blob:|^data:/.test(r.url()))unexpected.push(r.url());});
+  await context.addInitScript(()=>{
+    const original=HTMLCanvasElement.prototype.getContext, drawImage=CanvasRenderingContext2D.prototype.drawImage;
+    const actualDraw=WebGL2RenderingContext.prototype.drawElements, arrays=WebGL2RenderingContext.prototype.drawArrays;
+    window.canvasChecks={viewportCPU:0,viewportBlits:0,maxBlits:0,webglDraws:0};
+    HTMLCanvasElement.prototype.getContext=function(type,options){if(this.matches('.draw-viewport,.draw-overlay')&&options?.willReadFrequently)window.canvasChecks.viewportCPU++;return original.call(this,type,options);};
+    CanvasRenderingContext2D.prototype.drawImage=function(...args){if(this.canvas.matches('.draw-viewport'))window.canvasChecks.viewportBlits++;return drawImage.apply(this,args);};
+    const clear=CanvasRenderingContext2D.prototype.clearRect;
+    CanvasRenderingContext2D.prototype.clearRect=function(...args){if(this.canvas.matches('.draw-viewport')){window.canvasChecks.maxBlits=Math.max(window.canvasChecks.maxBlits,window.canvasChecks.viewportBlits);window.canvasChecks.viewportBlits=0;}return clear.apply(this,args);};
+    WebGL2RenderingContext.prototype.drawElements=function(...args){window.canvasChecks.webglDraws++;return actualDraw.apply(this,args);};
+    WebGL2RenderingContext.prototype.drawArrays=function(...args){window.canvasChecks.webglDraws++;return arrays.apply(this,args);};
+  });
+  const cdp=await context.newCDPSession(page);
+  const touch=async(type,points)=>cdp.send('Input.dispatchTouchEvent',{type,touchPoints:points.map(([x,y],id)=>({x,y,id,radiusX:3,radiusY:3,force:1}))});
+  const tap=async points=>{await touch('touchStart',points);await touch('touchEnd',[]);};
+  const text=(name)=>page.getByRole('button',{name,exact:true});
+  const waitSaved=()=>page.waitForFunction(()=>document.querySelector('.draw-workspace:not([hidden]) .save-indicator')?.title==='Saved on device');
+  const readProjects=async()=>page.evaluate(async()=>{
+    const db=await new Promise((resolve,reject)=>{const e=indexedDB.open('komastudio-v1',1);e.onsuccess=()=>resolve(e.result);e.onerror=()=>reject(e.error);});
+    const list=await new Promise((resolve,reject)=>{const e=db.transaction('projects').objectStore('projects').getAll();e.onsuccess=()=>resolve(e.result);e.onerror=()=>reject(e.error);});
+    db.close();return list.map(p=>({...p, layers:p.layers.map(l=>({...l,png:l.png?.size||0})),reference:p.reference?{...p.reference,blob:p.reference.blob.size}:null,thumb:p.thumb?.size}));
+  });
+  const samples=()=>page.evaluate(async()=>{
+    const db=await new Promise(r=>{const q=indexedDB.open('komastudio-v1',1);q.onsuccess=()=>r(q.result);});
+    const projects=await new Promise(r=>{const q=db.transaction('projects').objectStore('projects').getAll();q.onsuccess=()=>r(q.result);});db.close();
+    const p=projects.find(p=>p.w===512&&p.h===768), blob=p.layers[0].png;
+    if(!blob)return [0,0,0];
+    const img=await createImageBitmap(blob),c=document.createElement('canvas');c.width=p.w;c.height=p.h;
+    const ctx=c.getContext('2d',{willReadFrequently:true});ctx.drawImage(img,0,0);img.close();
+    const data=ctx.getImageData(0,0,p.w,p.h).data;return [256,196,316].map(x=>data[(384*p.w+x)*4+3]);
+  });
+  await page.goto(server.url,{waitUntil:'domcontentloaded'});
+  await page.getByRole('heading',{name:'Draw what you imagine.'}).waitFor();
+  await page.waitForFunction(()=>!!navigator.serviceWorker.controller,{timeout:30000});
+  assert.equal(await page.evaluate(()=>crossOriginIsolated),true);
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth),390);
+  await screenshots(page,'home-mobile');
+  const session=await browser.newBrowserCDPSession();
+  const gpu=(await session.send('SystemInfo.getInfo')).gpu;
+  assert.match(gpu.featureStatus['2d_canvas'],/^enabled/);assert.match(gpu.featureStatus.webgl2,/^enabled/);
+  await session.detach();
+  console.log(`Canvas acceleration and WebGL 2 enabled (headless adapter: ${gpu.devices[0]?.deviceString})`);
+
+  await page.getByRole('button',{name:/Custom Canvas Set size/}).tap();
+  const dialog=page.getByRole('dialog',{name:'Custom canvas'});
+  await dialog.getByRole('button',{name:'Landscape',exact:true}).tap();
+  assert.equal(await dialog.getByLabel('Width in pixels').inputValue(),'1920');
+  await dialog.getByLabel('Width in pixels').fill('255');
+  assert.equal(await dialog.getByRole('button',{name:'Create canvas'}).isEnabled(),false);
+  await dialog.getByLabel('Width in pixels').fill('512');await dialog.getByLabel('Height in pixels').fill('768');
+  await dialog.getByRole('button',{name:'Transparent',exact:true}).tap();
+  await dialog.getByRole('button',{name:'Create canvas'}).tap();
+  const viewport=page.getByTestId('draw-viewport');
+  await page.locator('.draw-stage .stage-label').filter({hasText:'512 × 768 px'}).waitFor();
+  const b=await viewport.boundingBox(), center=[b.x+b.width/2,b.y+b.height/2];
+  const dpr=await viewport.evaluate(c=>c.width/c.getBoundingClientRect().width);
+  assert.ok(dpr>=1.49&&dpr<=1.51,`Draw DPR ${dpr}`);
+  assert.equal(await page.evaluate(()=>window.canvasChecks.viewportCPU),0);
+
+  await page.getByRole('button',{name:/Choose brush/}).tap();await page.getByRole('button',{name:/Cel Block Hard-edge/}).tap();
+  const slider=await page.getByRole('slider',{name:'Opacity',exact:true}).boundingBox();
+  await tap([[slider.x+slider.width/2,slider.y+slider.height/2]]);
+  assert.equal(await page.getByRole('slider',{name:'Opacity',exact:true}).getAttribute('aria-valuenow'),'50');
+  const [x,y]=center;
+  await touch('touchStart',[[x-70,y]]);
+  for(const dx of [-45,-15,20,49,75,30,0,-45,-70])await touch('touchMove',[[x+dx,y]]);
+  for(const off of [[x-35,y-25],[x,y-58],[x,y+60]])await touch('touchMove',[off]);
+  await touch('touchEnd',[]);
+  await waitSaved();
+  const ink=await samples();
+  assert.ok(ink.every(a=>a>=126&&a<=130),`uniform stroke opacity: ${ink}`);
+  assert.equal(await page.evaluate(()=>window.canvasChecks.maxBlits),3);
+  console.log(`Uniform, single-pass Cel Block alpha: ${ink.join(', ')}; 3 viewport blits during strokes`);
+  await tap([[x-44,y+140],[x+44,y+140]]);await waitSaved();assert.deepEqual(await samples(),[0,0,0]);
+  await tap([[x-48,y+140],[x,y+145],[x+48,y+140]]);await waitSaved();assert.deepEqual(await samples(),ink);
+  // Pinch (with movement) should zoom, not undo.
+  await touch('touchStart',[[x-40,y],[x+40,y]]);await touch('touchMove',[[x-75,y-8],[x+75,y+8]]);await touch('touchEnd',[]);
+  assert.ok(parseInt(await page.locator('.draw-foot button').textContent())>60);
+  await text('Fit canvas').tap();
+
+  const solid=await page.evaluate(()=>{const c=document.createElement('canvas');c.width=48;c.height=80;const d=c.getContext('2d');d.fillStyle='#de4488';d.fillRect(0,0,48,80);return c.toDataURL().split(',')[1];});
+  await text('Ref').tap();
+  await page.getByLabel('Reference image file').setInputFiles({name:'color.png',mimeType:'image/png',buffer:Buffer.from(solid,'base64')});
+  const reference=page.getByAltText('Reference image · tap to sample a color');
+  await reference.waitFor();await page.waitForFunction(()=>document.querySelector('.ref-image')?.naturalWidth===48);
+  await reference.tap();await page.getByText('#DE4488',{exact:false}).first().waitFor();
+  assert.match(await page.locator('.draw-foot').innerText(),/#DE4488/);
+  await page.getByRole('button',{name:/Viewer size md/}).tap();await page.getByRole('button',{name:/Viewer size lg/}).tap();
+  await screenshots(page,'draw-reference-mobile');
+  await text('Close reference viewer').tap();
+  await text('Brush color').tap();
+  await page.getByRole('button',{name:'Studio accents #82CCBA'}).tap();await text('Done').tap();
+  await touch('touchStart',[[x,y]]);await new Promise(r=>setTimeout(r,510));await touch('touchEnd',[]);
+  const picked=(await page.locator('.draw-foot').innerText()).match(/#([A-F0-9]{6})/)[1];
+  assert.ok([45,37,57].every((v,i)=>Math.abs(v-parseInt(picked.slice(i*2,i*2+2),16))<=1),`Long press sampled #${picked}`);
+  await text('Layers').tap();
+  await text('Add layer').tap();
+  await page.getByLabel('Layer name',{exact:true}).fill('Shade');await page.getByLabel('Layer name',{exact:true}).press('Enter');
+  await page.getByLabel('Clipping Mask',{exact:true}).check();
+  await page.getByLabel('Blend mode',{exact:true}).selectOption('multiply');
+  await screenshots(page,'draw-layers-mobile');
+  await text('Close layers').tap();
+  await waitSaved();
+  const newProject=(await readProjects()).find(p=>p.w===512&&p.h===768);
+  assert.equal(newProject.layers.length,2);assert.equal(newProject.layers[1].name,'Shade');assert.equal(newProject.layers[1].blend,'multiply');assert.ok(newProject.layers[1].clip&&newProject.thumb>0);
+
+  await text('Export PNG').tap();
+  const downloadPromise=page.waitForEvent('download');await text('Save PNG').tap();
+  const saved=await downloadPromise;
+  assert.match(saved.suggestedFilename(),/\.png$/);
+  const buffer=await readFile(await saved.path());assert.equal(buffer.readUInt32BE(16),512);assert.equal(buffer.readUInt32BE(20),768);
+  await text('Back to home').tap();
+  await page.getByRole('button',{name:/Quick Draw 1080/}).tap();
+  await page.locator('.draw-stage .stage-label').filter({hasText:'1080 × 1520 px'}).waitFor();
+  assert.ok((await readProjects()).some(p=>p.w===1080&&p.h===1520&&p.reference?.blob>0));
+  await screenshots(page,'quick-draw-mobile');
+  await text('Back to home').tap();
+
+  await context.setOffline(true);
+  await page.reload({waitUntil:'domcontentloaded'});
+  await page.getByRole('button',{name:/Photo → 3D Pose Copy body/}).tap();
+  await page.getByLabel('Pose photo file').setInputFiles({name:'studio-test.webp',mimeType:'image/webp',buffer:await readFile('public/art/pose-example.webp')});
+  await page.getByTestId('skeleton-preview').waitFor({timeout:65000});
+  assert.match(await page.locator('.photo-result').innerText(),/Body detected[\s\S]*2 hands found/);
+  const handOverlay=async()=>page.getByTestId('skeleton-preview').evaluate(c=>{
+    // Read a dedicated scratch canvas so production canvas contexts remain unchanged.
+    const tmp=document.createElement('canvas');tmp.width=c.width;tmp.height=c.height;
+    const ctx=tmp.getContext('2d');ctx.drawImage(c,0,0);const data=ctx.getImageData(0,0,tmp.width,tmp.height).data;
+    let n=0;for(let i=0;i<data.length;i+=4)if(data[i]===150&&data[i+1]===240&&data[i+2]===208)n++;return n;
+  });
+  assert.ok(await handOverlay()>50);
+  await page.getByLabel('Hands',{exact:true}).uncheck();assert.equal(await handOverlay(),0);
+  await page.getByLabel('Hands',{exact:true}).check();
+  const nativePreview=await page.getByTestId('skeleton-preview').evaluate(c=>c.toDataURL());
+  await page.getByLabel('Mirror L⇄R',{exact:true}).check();
+  await page.waitForFunction(data=>document.querySelector('[data-testid=skeleton-preview]').toDataURL()!==data,nativePreview);
+  await screenshots(page,'photo-mobile');
+  await text('Apply pose').tap();
+  assert.equal(await text('Undo pose').isEnabled(),true);
+  await text('Undo pose').tap();await text('Redo pose').tap();
+  await screenshots(page,'solved-pose-mobile');
+  const poseDpr=await page.getByLabel('3D pose viewport').evaluate(c=>c.width/c.getBoundingClientRect().width);
+  assert.ok(poseDpr>=1.24&&poseDpr<=1.26,`Pose DPR ${poseDpr}`);
+  await text('Use pose reference').tap();await page.locator('.draw-stage .stage-label').filter({hasText:'1080 × 1520 px'}).waitFor();
+  const transferred=(await readProjects()).filter(p=>p.pose?.rotations?.leftUpperArm&&p.reference).at(-1);
+  assert.ok(transferred.reference.blob>500&&Object.keys(transferred.pose.rotations).length>15);
+  const renderCount=await page.evaluate(()=>canvasChecks.webglDraws);
+  await screenshots(page,'photo-reference-mobile');
+  assert.equal(await page.evaluate(()=>canvasChecks.webglDraws),renderCount,'Pose WebGL should be paused in Draw mode');
+  console.log('Offline MediaPipe: 33 body landmarks + two 21-landmark hands, preview/mirror, rig solve, undo/redo, bake');
+
+  await text('Open 3D Pose Studio').tap();
+  const model=page.getByLabel('Figure model',{exact:true});await model.selectOption('chibi');await page.waitForFunction(()=>document.querySelector('.pose-stage .stage-label')?.textContent.includes('Chibi'));
+  await page.getByRole('tab',{name:'Shape'}).tap();await text('Athletic').tap();
+  assert.match(await page.getByRole('tabpanel').innerText(),/\+65%/);
+  await text('Use pose reference').tap();await page.locator('.draw-stage .stage-label').filter({hasText:'1080 × 1520 px'}).waitFor();await waitSaved();
+  assert.ok((await readProjects()).some(p=>p.pose?.model==='chibi'&&p.pose.shape.arms===.65));
+  assert.deepEqual(errors,[],'console/page errors');assert.deepEqual(failed,[],'failed asset responses');assert.deepEqual(unexpected,[],'non-local requests');
+  console.log('PASS: 390×844 mobile production workflow; no console/page errors or external requests. Screenshots: artifacts/.');
+} catch(e) {
+  if(page)await screenshots(page,'mobile-failure').catch(()=>{});
+  throw e;
+} finally{await browser.close();server.close();}
